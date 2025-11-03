@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-CodespacesOS (no external deps)
+CodespacesOS (no external deps) - enhanced with web loading screen and improved web UI.
 
 - Single-file Python server + terminal OS.
 - Uses only Python stdlib. No Flask.
-- Starts an HTTP server (0.0.0.0:5000) serving ./static and two endpoints:
+- Starts an HTTP server (0.0.0.0:5000) serving ./static and endpoints:
     POST /command  -> accepts JSON {"cmd":"..."} from web UI
     GET  /output   -> returns last N lines of output as plain text
     GET  /pollseq  -> returns a numeric sequence token representing latest output index
-- Also runs a curses-based full-screen terminal UI (black bg, white text) you use locally.
+    GET  /status   -> returns {"status":"ready","seq":...} to indicate server readiness
+- Also runs a curses-based full-screen terminal UI (black bg, white text) locally.
 - Commands entered in either the terminal UI or the web UI are run by the same handler.
-- Arcade games are text-based and run inside the terminal UI; limited play from web UI (turn-based).
-- Run: python codespaces_os.py
-- In Codespaces: open a new terminal pane to simulate a separate window, run it there, open port 5000 in Ports panel -> Open in Browser.
+- Web UI includes a loading screen, connection status, command history, auto-scroll and nicer formatting.
 
-Limitations / safety:
-- This runs commands implemented in Python only (no shell execution).
-- File operations are limited to the workspace.
+Run: python codespaces_os.py
+In Codespaces: open a new terminal pane to simulate a separate window, run it there, open port 5000 in Ports panel -> Open in Browser.
 """
-
+from __future__ import annotations
 import os
 import sys
 import threading
@@ -27,23 +25,31 @@ import time
 import queue
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from datetime import datetime
 
 # Config
 HOST = "0.0.0.0"
 PORT = 5000
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-OUTPUT_MAX_LINES = 1000
+OUTPUT_MAX_LINES = 2000
+
+# Server readiness event for the web UI loading screen / terminal loading indicator
+server_ready = threading.Event()
 
 # Shared output buffer and queue for incoming commands (thread-safe)
-output_lines = []
+output_lines: list[str] = []
 output_lock = threading.Lock()
 cmd_queue = queue.Queue()
 
+def _timestamp():
+    return datetime.now().strftime("%H:%M:%S")
+
 def push_output(text):
-    """Append a line or multiline text to the shared output buffer."""
+    """Append a line or multiline text to the shared output buffer, prefixing a timestamp."""
     with output_lock:
         for line in str(text).splitlines():
-            output_lines.append(line)
+            # avoid double-empty timestamped lines; keep empty lines but give them a timestamp too
+            output_lines.append(f"[{_timestamp()}] {line}")
         # trim
         if len(output_lines) > OUTPUT_MAX_LINES:
             output_lines[:] = output_lines[-OUTPUT_MAX_LINES:]
@@ -228,8 +234,6 @@ def cmd_arcade(args):
         return "Usage: arcade tictactoe|hangman|number"
     g = args[0].lower()
     if g == "number":
-        # start a number guessing game for the client: store in per-session map if necessary
-        # for simplicity respond with instructions; web client can use guess <n>
         return "Number guess started. Server supports guess <n> to play. (Single-process demo)"
     if g == "tictactoe":
         return "TicTacToe started. Play via terminal for full experience."
@@ -316,6 +320,12 @@ class Handler(SimpleHTTPRequestHandler):
         candidate = os.path.join(STATIC_DIR, p)
         return candidate
 
+    def _set_json_headers(self, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+
     def do_POST(self):
         # only endpoint we accept: /command
         if self.path != "/command":
@@ -330,17 +340,14 @@ class Handler(SimpleHTTPRequestHandler):
             cmd = data.get("cmd", "")
         except Exception:
             cmd = ""
-        # enqueue and wait for result synchronously with timeout
-        # For simplicity, we will handle web commands by executing directly in the handler thread.
+        # execute command synchronously in handler thread
         out = handle_command_line(cmd, from_where="web")
-        # echo output into shared buffer as well
+        # echo command and output into shared buffer (so terminal and other web clients see it)
         push_output(f"> {cmd}")
         push_output(out)
         # respond
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        resp = {"status":"ok", "out": out, "seq": get_output_seq()}
+        self._set_json_headers(200)
+        resp = {"status":"ok", "out": out, "seq": get_output_seq(), "ts": _timestamp()}
         self.wfile.write(json.dumps(resp).encode("utf8"))
 
     def do_GET(self):
@@ -355,11 +362,14 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/pollseq":
             seq = get_output_seq()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.end_headers()
+            self._set_json_headers(200)
             self.wfile.write(json.dumps({"seq": seq}).encode("utf8"))
+            return
+        if self.path == "/status":
+            seq = get_output_seq()
+            # simple status endpoint that web UI can poll during loading
+            self._set_json_headers(200)
+            self.wfile.write(json.dumps({"status": "ready", "seq": seq}).encode("utf8"))
             return
         # else serve static files via SimpleHTTPRequestHandler
         return super().do_GET()
@@ -368,9 +378,17 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 def start_http_server():
+    # ensure static directory exists before chdir
+    if not os.path.isdir(STATIC_DIR):
+        push_output("Static directory not found; web UI will be disabled.")
+        # do not attempt to serve; still set ready so terminal proceeds
+        server_ready.set()
+        return
     os.chdir(STATIC_DIR)  # ensure relative assets served correctly
     server = ThreadedHTTPServer((HOST, PORT), Handler)
     push_output(f"HTTP server serving {STATIC_DIR} at http://{HOST}:{PORT}")
+    # mark server as ready so UI/loading screens can proceed
+    server_ready.set()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -407,13 +425,16 @@ def run_terminal_shell():
             push_output(out)
         return
 
-    # curses full-screen
+    # curses full-screen with a mini loading animation while HTTP server starts
     def curses_main(stdscr):
         # minimal black background, white text
         curses.start_color()
         curses.use_default_colors()
         try:
             curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)
+            curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+            curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
+            curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
         except Exception:
             pass
         stdscr.bkgd(' ', curses.color_pair(1))
@@ -424,18 +445,48 @@ def run_terminal_shell():
         output_win = curses.newwin(height-1, width, 0, 0)
         output_win.scrollok(True)
 
+        # show a loading overlay until server_ready is set (or timeout)
+        overlay_shown = False
+        start_wait = time.time()
+        while not server_ready.is_set() and time.time() - start_wait < 5:
+            overlay_shown = True
+            stdscr.erase()
+            msg = "Starting CodespacesOS..."
+            spinner = "|/-\\"
+            for i in range(8):
+                if server_ready.is_set():
+                    break
+                stdscr.addstr(height//2, max(0, (width - len(msg))//2), msg, curses.color_pair(4))
+                stdscr.addstr(height//2 + 1, width//2, spinner[i % len(spinner)])
+                stdscr.refresh()
+                time.sleep(0.12)
+        if overlay_shown:
+            stdscr.erase()
+            stdscr.refresh()
+
         # initial display
         push_output(welcome)
+
+        # simple scrollback pointer for the terminal view
+        scroll_offset = 0
 
         while True:
             # draw output buffer
             output_win.erase()
             with output_lock:
-                start = max(0, len(output_lines) - (height-2))
-                to_show = output_lines[start:]
-                for i,line in enumerate(to_show):
+                avail_lines = len(output_lines)
+                max_display = height - 2
+                start = max(0, avail_lines - max_display - scroll_offset)
+                to_show = output_lines[start:start + max_display]
+                for i, line in enumerate(to_show):
                     try:
-                        output_win.addstr(i, 0, line[:width-1])
+                        # colorization heuristics
+                        if line.strip().startswith("> "):
+                            output_win.addstr(i, 0, line[:width-1], curses.color_pair(2))
+                        elif "error" in line.lower() or "error:" in line.lower():
+                            output_win.addstr(i, 0, line[:width-1], curses.color_pair(3))
+                        else:
+                            output_win.addstr(i, 0, line[:width-1], curses.color_pair(1))
                     except Exception:
                         pass
             output_win.refresh()
@@ -447,7 +498,7 @@ def run_terminal_shell():
             # read user input (blocking)
             curses.echo()
             try:
-                raw = input_win.getstr(0, len(prompt), 200).decode("utf8")
+                raw = input_win.getstr(0, len(prompt), 400).decode("utf8")
             except KeyboardInterrupt:
                 break
             except Exception:
@@ -463,7 +514,7 @@ def run_terminal_shell():
                 break
             push_output(out)
             # small sleep to allow UI update
-            time.sleep(0.05)
+            time.sleep(0.03)
 
     try:
         import curses
@@ -487,11 +538,9 @@ def run_terminal_shell():
 
 # --- Entrypoint ---
 def main():
-    # ensure static dir exists
+    # ensure static dir exists (the script will still run without the web UI)
     if not os.path.isdir(STATIC_DIR):
-        print("Error: static directory not found. Create a 'static' folder next to this script.")
-        sys.exit(1)
-
+        print("Warning: static directory not found. Web UI disabled. Create a 'static' folder next to this script to enable the web interface.")
     # Start HTTP server thread
     http_thread = threading.Thread(target=start_http_server, daemon=True)
     http_thread.start()
