@@ -1,16 +1,46 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>DOPA OS - Terminal Window</title>
-  <link rel="stylesheet" href="/main.css">
+  <meta charset="utf-8" />
+  <title>CodespacesOS Web UI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div id="term" class="term" tabindex="0" aria-live="polite"></div>
-  <div id="inputline" class="inputline">
-    <span id="prompt">~/ $ </span><input id="cmd" autocomplete="off" />
+  <div id="loading" class="overlay">
+    <div class="spinner"></div>
+    <div class="loading-text">Connecting to CodespacesOS...</div>
+    <div id="loading-sub" class="loading-sub">Waiting for server</div>
   </div>
-  <script src="/main.js"></script>
+
+  <div id="app" class="hidden">
+    <header>
+      <div class="title">CodespacesOS Web Console</div>
+      <div class="status">
+        <span id="connection" class="badge disconnected">Disconnected</span>
+        <button id="clear-btn" title="Clear output">Clear</button>
+        <button id="download-btn" title="Download log">Download</button>
+        <label class="small">Poll:
+          <select id="poll-interval">
+            <option value="500">0.5s</option>
+            <option value="1000" selected>1s</option>
+            <option value="2000">2s</option>
+            <option value="5000">5s</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <main>
+      <pre id="console" class="console" aria-live="polite"></pre>
+    </main>
+
+    <footer>
+      <input id="cmd-input" placeholder="Type a command (e.g. help, ls)" autocomplete="off" />
+      <button id="send-btn">Send</button>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
 </body>
 </html>
